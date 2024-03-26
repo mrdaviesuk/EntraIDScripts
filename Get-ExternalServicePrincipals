@@ -1,0 +1,144 @@
+## Define Connection/Auth Parameters
+$AppId = '<<-INSERT-ENTRAID-APPID->>'
+$AppSecret = '<<-INSERT-ENTRAID-APP-SECRET->>'
+$TenantName = '<<-TENANTNAME->>.onmicrosoft.com'
+$tenantID = '<<-INSERT-TENANT-ID->>'
+
+#region Functions
+
+## Define Function to Retrieve Entra Tenant Config
+Function Get-EntraTenantConfiguration
+{
+       
+  [CmdletBinding()]
+  [OutputType([string])]
+  PARAM (
+    [Parameter(ParameterSetName = 'ByTenantId', Position=0,Mandatory=$true)]
+    [ValidateScript({
+        try{
+            [System.Guid]::Parse($_) | Out-Null
+            $true
+        } 
+        catch{
+            $false
+        }
+    })]
+    [Alias('tID')]
+    [String]$TenantID,
+
+    [Parameter(ParameterSetName = 'ByTenantName', Position=1,Mandatory=$true)][Alias('cred')]
+    [ValidateNotNullOrEmpty()]
+    [String]
+    $TenantName
+  )
+  
+    if ($PScmdlet.ParameterSetName -eq 'ByTenantId'){
+        $URI = "https://login.windows.net/$TenantId/.well-known/openid-configuration"
+    }
+    else{
+        $URI = "https://login.windows.net/$TenantName/.well-known/openid-configuration"
+    }
+    $Response = Invoke-WebRequest -UseBasicParsing -Uri $URI -Method Get
+    $json = ConvertFrom-Json -InputObject $Response.Content
+    $json
+}
+#endregion
+
+# Set Graph API Scope and Tenant Login URL
+$Scope = "https://graph.microsoft.com/.default"
+$Url = "https://login.microsoftonline.com/$TenantName/oauth2/v2.0/token"
+
+# Create Request Body
+$Body = @{
+    client_id = $AppId
+	client_secret = $AppSecret
+	scope = $Scope
+	grant_type = 'client_credentials'
+}
+
+# Add System.Web for urlencode support
+Add-Type -AssemblyName System.Web
+
+# Splat Parameters for Invoke-Restmethod for Token
+$PostSplat = @{
+    ContentType = 'application/x-www-form-urlencoded'
+    Method = 'POST'
+    Body = $Body
+    Uri = $Url
+}
+
+# Request Token
+$Request = Invoke-RestMethod @PostSplat
+
+# Create Header with Token for Subsequent Requests
+$Header = @{
+    ContentType = 'application/json'
+    Authorization = "$($Request.token_type) $($Request.access_token)"
+}
+
+Write-Host -ForegroundColor Yellow "`n#############################################"
+Write-Host -ForegroundColor Yellow "##  Service Principal Enumeration Script  ###"
+Write-Host -ForegroundColor Yellow "#############################################`n"
+
+# Fetch all Azure Service Principals
+#####################################
+$Uri = "https://graph.microsoft.com/v1.0/servicePrincipals"
+$servicePrincipals = Invoke-RestMethod -Uri $Uri -Headers $Header -Method Get -ContentType "application/json" 
+Write-Host -ForegroundColor Yellow "[+] Retrieving ALL Service Principals in this Tenant"
+$servicePrincipals.value | FT servicePrincipalType, appDisplayName, accountEnabled, appId, appOwnerOrganizationId, signInAudience, tags, description
+
+# Return only Service Principals in the Tenant which aren't Microsoft Azure Native/From MS Applications
+#######################################################################################################
+Write-Host -ForegroundColor Yellow "[+] Retrieving ALL Service Principals in this Tenant NOT derived from Microsoft Owned Applications:"
+$servicePrincipals.value | Where-Object { $_.appOwnerOrganizationId -ne 'f8cdef31-a31e-4b4a-93e4-5f571e91255a' } | FT servicePrincipalType, appDisplayName, accountEnabled, appId, appOwnerOrganizationId, signInAudience, tags, description
+
+# Return Service Principals from other Tenants 
+###############################################
+Write-Host -ForegroundColor Yellow "[+] Entra Service Principals in this Tenant from Application orignating from OUTSIDE this Tenant:"
+$externalServicePrincipals = $servicePrincipals.value | Where-Object { ($_.appOwnerOrganizationId -ne 'f8cdef31-a31e-4b4a-93e4-5f571e91255a') -and ($_.AppOwnerOrganizationId -ne $tenantID) } 
+$externalServicePrincipals | FT servicePrincipalType, appDisplayName, accountEnabled, appId, appOwnerOrganizationId, createdDateTime
+
+# Present Details of Current Tenant to Aid Review of External 
+#############################################################
+$Uri = "https://graph.microsoft.com/v1.0/tenantRelationships/findTenantInformationByTenantId(tenantId='$TenantId')"
+$thisTenant = Invoke-RestMethod -Uri $Uri -Headers $Header -Method Get -ContentType "application/json"
+$tenantLocation = (Get-EntraTenantConfiguration -TenantID $tenantID).tenant_region_scope
+Write-Host -ForegroundColor Green "[+] The tenant is:" $thisTenant.defaultDomainName
+Write-Host -ForegroundColor Green "[+] This Tenant is deployed in:" $tenantLocation "`n"
+
+# Show Details of Any Connected Orgs, which might be the origin of an Application which has a Service Principal present in this Tenant 
+######################################################################################################################################
+$Uri = "https://graph.microsoft.com/v1.0//identityGovernance/entitlementManagement/connectedOrganizations?$select=identitySources"
+$connectedOrgs = Invoke-RestMethod -Uri $Uri -Headers $Header -Method Get -ContentType "application/json"
+Write-Host -ForegroundColor Green "[+] This Tenant has the following Connected Organizations:" 
+$connectedOrgs.value | FT displayName, description, state, identitySources
+
+# Collate Details of Originating Tenants for Applications with Service Principals present in the current Tenant
+###############################################################################################################
+$externalSPHomeTenants = New-Object -TypeName PSCustomObject
+ForEach ($externalPrincipal in $externalServicePrincipals){
+    
+    $externalTenantId = $externalPrincipal.appOwnerOrganizationId
+    $Uri = "https://graph.microsoft.com/v1.0/tenantRelationships/findTenantInformationByTenantId(tenantId='$externalTenantId')"
+    $homeTenant = Invoke-RestMethod -Uri $Uri -Headers $Header -Method Get -ContentType "application/json"
+    $tenantLocation = (Get-EntraTenantConfiguration -TenantID $externalPrincipal.appOwnerOrganizationId).tenant_region_scope
+
+    $externalSPHomeTenants = [PSCustomObject]@{
+        appDisplayName = $externalPrincipal.appDisplayName
+        createdDateTime = $externalPrincipal.createdDateTime
+        enabled = $externalPrincipal.accountEnabled
+        appOwnerHomeTenantName = $homeTenant.defaultDomainName
+        appOwnerHomeTenantRegion = $tenantLocation
+        appOwnerOrganizationId = $externalPrincipal.appOwnerOrganizationId
+    }
+    
+}
+
+# PResent Details of the Home Tenant for Applications which have a Service Principal Present in this Tenant
+###########################################################################################################
+Write-Host -ForegroundColor Yellow "[+] Originating Tenants for Applications with Entra Service Principals from OUTSIDE this Tenant:"
+$externalSPHomeTenants | FT
+
+Write-Host -ForegroundColor Yellow "`n############################################"
+Write-Host -ForegroundColor Yellow "##        Script Execition Completed     ###"
+Write-Host -ForegroundColor Yellow "############################################`n"
